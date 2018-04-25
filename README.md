@@ -1,2 +1,2 @@
 # ais_staypoint
-About AIS Data cleaning，First&amp;Second staypoint，Staypoint Clustering
+About AIS Data reading&cleaning，First&amp;Second staypoint，Staypoint Clustering
