@@ -53,6 +53,12 @@ def shiptrans(ship_type):
 
 udfshiptrans = func.udf(shiptrans,IntegerType()) 
 
+'''
+stay_id的求解与channel_id类似：
+利用label和pre_label表示label状态的改变
+通过状态和与mmsi的hash值求解stay_id
+'''
+
 def getPrevPos(data,spark):
     windowSpec = Window.partitionBy(data['mmsi']).orderBy(data["timestamp"].asc())
     data = data.withColumn("ship_type",udfshiptrans("ship_type"))
