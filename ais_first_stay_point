@@ -1,0 +1,132 @@
+# -*- coding: UTF-8 -*-
+#!/usr/bin/env python2
+from pyspark.sql.window import Window
+import pyspark.sql.functions as func
+from pyspark.sql import SparkSession
+from pyspark.sql.types import DoubleType
+from pyspark.storagelevel import StorageLevel
+import numpy as np
+from math import *
+import math
+import sys
+from datetime import datetime, timedelta
+from pyspark.sql import types
+from ais.utils import *
+SPEED_THRESHOLD = 1
+EARTH_REDIUS = 6378.137
+
+#求解第一类停留点
+def run(loadDate):
+    spark = startimestampApark()
+    data = readData(loadDate, spark)
+    data = getPrevPos(data, spark)
+    data = getFirstSP(data, spark)
+    saveData(data, loadDate, spark)
+
+
+def startimestampApark():
+    spark = SparkSession \
+        .builder \
+        .appName("CalFirstStayPoint on Latitude & Longitude") \
+        .enableHiveSupport()\
+        .getOrCreate()
+    return spark
+
+
+def readData(loadDate,spark):
+    yestDate = datetime.strptime(loadDate, "%Y-%m-%d") - timedelta(1)
+    yestDate = yestDate.strftime("%Y-%m-%d")
+    cfg = readConf()
+    input_table = cfg['data_cfg']['database'] + "." + cfg['data_cfg']['ais_data_clean']
+    data = spark.sql("SELECT mmsi,ship_type,latitude_clean,longitude_clean,timestamp,pday FROM %s 
+                      where pday <= '%s' and pday >= '%s'" % (input_table,loadDate, yestDate))
+    data = data.repartition(10 * spark._sc.defaultParallelism)
+    data.persist(StorageLevel.DISK_ONLY)
+    data.count()
+    return data
+
+
+def shiptrans(ship_type):
+    ship_type = int(ship_type)
+    ship_type = ship_type / 10
+    return ship_type
+
+udfshiptrans = func.udf(shiptrans,IntegerType()) 
+
+def getPrevPos(data,spark):
+    windowSpec = Window.partitionBy(data['mmsi']).orderBy(data["timestamp"].asc())
+    data = data.withColumn("ship_type",udfshiptrans("ship_type"))
+    data = data.withColumn("prev_lat", func.lag("latitude_clean").over(windowSpec))
+    data = data.withColumn("prev_log", func.lag("longitude_clean").over(windowSpec))
+    data = data.withColumn("prev_timestamp", func.lag("timestamp").over(windowSpec))
+    data = data.withColumn("speed",udfgetSpeed("latitude_clean", "longitude_clean", "timestamp", "prev_lat", "prev_log", "prev_timestamp"))
+    data = data.withColumn("label", func.when(data['speed'] < SPEED_THRESHOLD, 1).otherwise(0).over(windowSpec))
+    data = data.withColumn("pre_label", func.lag("label").over(windowSpec))
+    data = data.withColumn("state_change",func.when(((data.pre_label != data.label) | (data.pre_label.isNull())), 1).otherwise(0).over(windowSpec))
+    data = data.withColumn("state_num", func.sum("state_change").over(windowSpec))
+    data = data.withColumn("stay_id", func.hash("mmsi", func.lit("&&&"), "state_num"))
+    data = data.withColumn("threshold", func.lit(SPEED_THRESHOLD))
+    return data
+
+
+def rad(d):
+    return d * pi / 180.0
+
+
+def getSpeed(latA, lngA,timestampA, latB, lngB, timestampB):
+    if(latB):
+        latA = float(latA)
+        lngA = float(lngA)
+        latB = float(latB)
+        lngB = float(lngB)
+        timestampA = long(timestampA)
+        timestampB = long(timestampB)
+    else:
+        return 0
+
+    radlatA = rad(latA)
+    radlatB = rad(latB)
+    a = radlatA - radlatB
+    b = rad(lngA) - rad(lngB)
+    s = 2 * math.asin(math.sqrt(math.pow(sin(a/2), 2) + cos(radlatA) * cos(radlatB) * math.pow(sin(b/2), 2)))
+    s = s * EARTH_REDIUS
+    time = timestampA - timestampB
+    return float(s/time*1000)
+
+
+udfgetSpeed = func.udf(getSpeed,DoubleType())
+
+
+def getFirstSP(data, spark):
+    stay = data.filter("label == 1").drop("pre_label").drop("state_change").drop("state_num").drop("speed")
+    results = stay.groupBy("stay_id","mmsi","ship_type","threshold").agg(func.mean("latitude_clean"),
+                            func.mean("longitude_clean"), func.max("timestamp").alias("stay_end_time"), 
+                            func.min("timestamp").alias("stay_start_time"),(func.max("timestamp") - func.min("timestamp")).alias("stay_time"))
+    return results
+
+
+def saveData(data,loadDate,spark):
+    """
+    Save data on loadDate
+    """
+    # 这里先要filter一下，只保存loadDate的数据
+    data = data.filter("pday = '%s'" % loadDate)
+    # 检测是否已经有表存在
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    spark.sql("use %s" % database)
+    tables = [i.name for i in spark.catalog.listTables()]
+    if "ais_first_stay_point" in tables:
+        spark.sql("alter table %s.ais_first_stay_point drop if exists partition(pday= '%s')" % (database, loadDate))
+        rowsDF.write.saveAsTable("%s.ais_first_stay_point" % database, partitionBy="pday", mode="append")
+    else:
+        rowsDF.write.saveAsTable("%s.ais_first_staypoint" % database, partitionBy="pday")
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        _, loadDate = sys.argv
+        run(loadDate)
+    else:
+        print >> sys.stderr,  """
+        Error! The usage is speed_lat_lon.py <loadDate>
+        """
