@@ -12,7 +12,6 @@ import sys
 from datetime import datetime, timedelta
 from pyspark.sql import types
 from ais.utils import *
-SPEED_THRESHOLD = 1
 EARTH_REDIUS = 6378.137
 
 #求解第一类停留点
@@ -60,6 +59,8 @@ stay_id的求解与channel_id类似：
 '''
 
 def getPrevPos(data,spark):
+    cfg = readConf()
+    SPEED_THRESHOLD = cfg['algorithm_cfg']['ais_first_time_threshold']
     windowSpec = Window.partitionBy(data['mmsi']).orderBy(data["timestamp"].asc())
     data = data.withColumn("ship_type",udfshiptrans("ship_type"))
     data = data.withColumn("prev_lat", func.lag("latitude_clean").over(windowSpec))
@@ -104,11 +105,14 @@ udfgetSpeed = func.udf(getSpeed,DoubleType())
 
 
 def getFirstSP(data, spark):
+    cfg = readConf()
+    TIME_THRESHOLD = cfg['algorithm_cfg']['ais_first_time_threshold']
     stay = data.filter("label == 1").drop("pre_label").drop("state_change").drop("state_num").drop("speed")
     results = stay.groupBy("stay_id","mmsi","ship_type","threshold").agg(func.mean("latitude_clean"),
                             func.mean("longitude_clean"), func.max("timestamp").alias("stay_end_time"), 
                             func.min("timestamp").alias("stay_start_time"),(func.max("timestamp") - func.min("timestamp")).alias("stay_time"))
-    return results
+    final = results.filter(results.stay_time > TIME_THRESHOLD )
+    return final
 
 
 def saveData(data,loadDate,spark):
