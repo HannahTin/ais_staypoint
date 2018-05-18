@@ -1,0 +1,193 @@
+# -*- coding: utf-8 -*-
+import sys
+import pyspark.sql.functions as func
+from pyspark.sql import SparkSession
+from datetime import datetime, timedelta
+import math
+from math import *
+from pyspark.sql import types
+from pyspark.sql import Row
+
+def spExtract(lat, lon, time_array, DIST_THRESHOLD, TIME_THRESHOLD, NUM_IN_STAY_POINT):
+    """
+    提取一串位置logs中的停留点
+	
+	参数
+	---
+	lat：纬度数据 类型为list
+	lon：经度数据 类型为list
+	time_array：时间戳数据 单位为秒
+	
+	返回
+	---
+	spList：由staypoint类型组成的list
+    """
+    pointNum = len(lat)
+    spList = []
+    # 注意类型的转换
+    time_array = [long(i) for i in time_array]
+    lat = [float(i) for i in lat]
+    lon = [float(i) for i in lon]
+    i = 0
+    while i < pointNum :
+        j = i + 1
+        token = 0
+        while j < pointNum: 
+            dist = getDistance(lat[i], lon[i], lat[j], lon[j])
+            if dist > DIST_THRESHOLD or j == pointNum - 1:
+                t = time_array[j] - time_array[i]
+                if t > TIME_THRESHOLD and j != i + NUM_IN_STAY_POINT:
+                    # 这里改一下
+                    sp = staypoint()
+                    sp.lat = float(np.mean(lat[i: j-1]))
+                    sp.lon = float(np.mean(lon[i: j-1]))
+                    sp.arvT = time_array[i]
+                    sp.levT = time_array[j-1]
+                    spList.append([sp.lat, sp.lon, sp.arvT, sp.levT])
+                    i = j
+                    token = 1
+                break
+            j = j + 1
+        if token!=1 :
+            i = i + 1
+    return spList
+
+schema = types.ArrayType(types.StructType([
+    types.StructField("lat", types.DoubleType(), False),
+    types.StructField("lon", types.DoubleType(), False),
+    types.StructField("arvT", types.IntegerType(), False),
+    types.StructField("levT", types.IntegerType(), False)
+]))
+udf_spExtract = func.udf(spExtract, schema)
+
+def getTime(arvT):
+    '''
+    function for changing timestamp to date
+    
+    	input
+	---
+	a UNIX timestamp
+
+    	output
+	---
+	a readable date YYYY-MM-DD
+    '''
+    arvT = int(arvT)
+    ts = datetime.fromtimestamp(arvT).strftime("%Y-%m-%d")
+    return ts
+
+getTime_udf = func.udf(getTime, types.StringType())
+
+def run(loadDate):
+    data = readData(loadDate)
+    data = staypointDetection(data, loadDate)
+    saveData(data, loadDate)
+    data = getSP(loadDate)
+    saveSP(data, loadDate)
+
+
+def startSpark():
+    spark = SparkSession \
+        .builder \
+        .appName("Class II Staypoint Detection") \
+        .enableHiveSupport()\
+        .getOrCreate()
+    return spark
+
+def readData(loadDate):
+    spark = startSpark()
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    clean_table = cfg['data_cfg']['clean_table']
+    yestDate = datetime.strptime(loadDate, "%Y-%m-%d") - timedelta(1)
+    yestDate = yestDate.strftime("%Y-%m-%d")
+    newDF = spark.sql("SELECT mmsi,ship_type,latitude_clean,longitude_clean,timestamp from %s.%s where pday <= '%s' and pday >= '%s'" % (database, clean_table, loadDate, yestDate))
+    return newDF
+
+
+def staypointDetection(data,loadDate):
+    logDF = data
+    dataDF = logDF.sort("mmsi","timestamp").groupBy("mmsi", "ship_type").agg(func.collect_list("latitude_clean").alias("lat"),func.collect_list("longitude_clean").alias("lon"),func.collect_list("timestamp").alias("time"))
+    print dataDF
+    cfg = readConf()
+    dist_threshold = cfg['algorithm_cfg']['dist_threshold']
+    time_threshold = cfg['algorithm_cfg']['time_threshold']
+    num_in_stay_point = cfg['algorithm_cfg']['num_in_stay_point']
+    dataDF = dataDF.withColumn("dist_threshold",func.lit(dist_threshold))
+    dataDF = dataDF.withColumn("time_threshold",fdistunc.lit(time_threshold))
+    dataDF = dataDF.withColumn("num_in_stay_point",func.lit(num_in_stay_point))
+    dataDF = dataDF.withColumn("staypoint", udf_spExtract("lat", "lon", "time", "dist_threshold", "time_threshold", "num_in_stay_point"))
+    dataDF = dataDF.withColumn("pday",func.lit(loadDate))
+    dataDF.show(10)
+    return dataDF
+    
+def saveData(data, loadDate):
+    spark = startSpark()
+    data = data.filter("pday = '%s'" % loadDate)
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    spark.sql("use %s" % database)
+    tables = [i.name for i in spark.catalog.listTables()]
+    if "sp_detection" in tables:
+        spark.sql("alter table %s.sp_detection drop if exists partition(pday='%s')" % (database, loadDate))
+        data.write.saveAsTable("%s.sp_detection" % database, partitionBy="pday", mode="append")
+    else:
+        data.write.saveAsTable("%s.sp_detection" % database, partitionBy="pday")
+
+
+
+
+def trans(x):
+    mmsi = x.mmsi
+    sp = x.staypoint
+    ship_type = int(x.ship_type)
+    ship_type = ship_type / 10
+    if ship_type > 9:
+	ship_type = ship_type /10
+    for i in sp:
+        yield Row(mmsi=mmsi, latitude_clean=i.lat, longitude_clean=i.lon, stay_start_time=i.arvT, stay_end_time=i.levT, ship_type=ship_type)
+
+
+
+
+
+def getSP(loadDate):
+    spark = startSpark()
+    yestDate = datetime.strptime(loadDate, "%Y-%m-%d") - timedelta(1)
+    yestDate = yestDate.strftime("%Y-%m-%d")
+    spDF = spark.sql("SELECT mmsi,staypoint,ship_type FROM ais_data.sp_detection where pday <= '%s' and pday >= '%s'" % (loadDate, yestDate))
+    spDF = spDF.rdd.flatMap(trans).toDF()
+    cfg = readConf()
+    dist_threshold = cfg['algorithm_cfg']['dist_threshold']
+    spDF = spDF.withColumn("stay_time", spDF.stay_end_time-spDF.stay_start_time)
+    spDF = spDF.withColumn("pday", getTime_udf(spDF.stay_start_time))
+    spDF = spDF.withColumn("threshold", func.lit(dist_threshold))
+    return spDF
+
+
+
+def saveSP(spDF, loadDate):
+    spark = startSpark()
+    print spDF.count()
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    second_sp_table = cfg['data_cfg']['second_sp_table']
+    threshold = cfg['algorithm_cfg']['dist_threshold']
+    spark.sql("use %s" % database)
+    tables = [i.name for i in spark.catalog.listTables()]
+    if second_sp_table in tables:
+        spark.sql("alter table %s.%s drop if exists partition(pday='%s', threshold=%f)" % (database, second_sp_table, loadDate, threshold))
+        spDF.write.saveAsTable("%s.%s" % (database, second_sp_table), partitionBy=("pday","threshold"), mode="append")
+    else:
+        spDF.write.saveAsTable("%s.%s" % (database, second_sp_table), partitionBy=("pday","threshold"))
+
+    
+    
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        _, loadDate = sys.argv
+        run(loadDate)
+    else:
+        print >> sys.stderr,  """
+        error: please run '<path>/bin/spark-submit <resources> staypoint_detection.py <loadDate> '
+        """
