@@ -1,0 +1,140 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+@author: yihancai
+"""
+import sys
+import pyspark.sql.functions as func
+from pyspark.sql.functions import udf
+from pyspark.sql.window import Window
+from pyspark.sql import SparkSession
+from pyspark.sql import types
+from pyspark.sql.types import ArrayType, DoubleType
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.linalg import VectorUDT
+from pyspark.ml.linalg import Vectors
+from ais.utils import *
+from datetime import datetime, timedelta
+from math import *
+import numpy as
+
+def run(loadDate):
+    cfg = readConf()
+    k_list = cfg['algorithm_cfg']['cluster_num']
+    for k in k_list:
+        print "the value of k is %d" % k
+        for i in range(0,9):
+            print "processing ship type #%d" % i
+            spDF = readData(loadDate, i)
+            centerDF = spClustering(spDF, loadDate, i , k)
+            saveData(centerDF, loadDate, i , k)
+
+def startSpark():
+    spark = SparkSession \
+        .builder \
+        .appName("Staypoint Clustering") \
+        .enableHiveSupport()\
+        .getOrCreate()
+    return spark
+
+def readData(loadDate, ship_type):
+    spark = startSpark()
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    second_sp_table = cfg['data_cfg']['second_sp_table']
+    window_size = cfg['algorithm_cfg']['cluster_window_size']
+    # endDate = loadDate + windowSize
+    endDate = datetime.strptime(loadDate, "%Y-%m-%d") + timedelta(window_size)
+    endDate = endDate.strftime("%Y-%m-%d")
+    spDF = spark.sql("SELECT * from %s.%s where pday >= '%s' and pday <= '%s' and ship_type = %d" % (database, second_sp_table, loadDate, endDate, ship_type))
+    return spDF
+
+def addCenters(prediction, centers):
+    return Vectors.dense(centers[prediction])
+
+def addCentersUDF(centers):
+    return func.udf(lambda p: addCenters(p, centers), VectorUDT())
+
+def computeErrors(features, centers):
+    return float(np.sum((features.toArray() - centers) ** 2))
+
+computeErrorsUDF = func.udf(computeErrors, DoubleType())
+
+def getter(column, index):
+    return float(column[index])
+
+getterUDF = udf(getter, DoubleType())
+
+def spClustering(spDF, loadDate, ship_type , k):
+    cfg = readConf()
+    cluster_num = k
+    window_size = cfg['algorithm_cfg']['cluster_window_size']
+    spDF = spDF.withColumn("lat_rad", spDF.latitude_clean * pi / 180).withColumn("lon_rad", spDF.longitude_clean * pi / 180)
+    spDF = spDF.withColumn("x", func.cos(spDF.lat_rad) * func.cos(spDF.lon_rad))
+    spDF = spDF.withColumn("y", func.cos(spDF.lat_rad) * func.sin(spDF.lon_rad))
+    spDF = spDF.withColumn("z", func.sin(spDF.lat_rad))
+    df = spDF.select(spDF.x, spDF.y, spDF.z)
+    cols = df.columns
+    vectorAss = VectorAssembler(inputCols=cols, outputCol="features")
+    vdf = vectorAss.transform(df)
+    kmeans = KMeans(k=cluster_num, maxIter=100, seed=1)
+    model = kmeans.fit(vdf)
+    transDF = model.transform(vdf)
+    transDF.show()
+    transDF = transDF.withColumn("centers", addCentersUDF(model.clusterCenters())(transDF.prediction))
+    transDF = transDF.withColumn("errors", computeErrorsUDF(transDF.features, transDF.centers))
+    df = transDF.groupBy("prediction", "centers").agg(func.sum("errors"), func.count("errors"))
+    # clusterSizes = model.clusterSizes()
+    df = df.withColumn("x", getterUDF(df.centers, func.lit(0)))
+    df = df.withColumn("y", getterUDF(df.centers, func.lit(1)))
+    df = df.withColumn("z", getterUDF(df.centers, func.lit(2)))
+    df = df.withColumnRenamed("count(errors)", "center_point_num")
+    df = df.withColumnRenamed("sum(errors)", "center_mse")
+    df = df.withColumn("lon", func.atan2(df.y, df.x))
+    df = df.withColumn("hyp", func.sqrt(df.x ** 2 + df.y ** 2))
+    df = df.withColumn("lat", func.atan2(df.z, df.hyp))
+    df = df.withColumn("center_longitude", df.lon * 180 / pi)
+    df = df.withColumn("center_latitude", df.lat * 180 / pi)
+    df = df.drop("lon").drop("hyp").drop("lat")
+    # add ship type
+    df = df.withColumn("ship_type", func.lit(ship_type))
+    # add pday and window size
+    df = df.withColumn("pday", func.lit(loadDate))
+    df = df.withColumn("window_size", func.lit(window_size))
+    # add cluster id
+    df = df.withColumn("num_cluster", func.lit(cluster_num))
+    df = df.withColumn("center_id", func.hash("pday", "window_size", "num_cluster", "prediction"))
+    df = df.drop("centers").drop("prediction").drop("x").drop("y").drop("z")
+    df.show(10)
+    return df
+
+
+def saveData(newDF, loadDate, ship_type , k):
+    spark = startSpark()
+    newDF = newDF.filter("pday = '%s'" % loadDate)
+    cfg = readConf()
+    database = cfg['data_cfg']['database']
+    cluster_table = cfg['data_cfg']['sp_cluster']
+    window_size = cfg['algorithm_cfg']['cluster_window_size']
+    k_first = cfg['algorithm_cfg']['cluster_num'][0]
+    spark.sql("use %s" % database)
+    tables = [i.name for i in spark.catalog.listTables()]
+    if cluster_table in tables:
+        if ship_type == 0 and k == k_first:
+            spark.sql("alter table %s.%s drop if exists partition(pday='%s', window_size=%d)"
+                % (database, cluster_table, loadDate, window_size))
+        newDF.write.saveAsTable("%s.%s" % (database, cluster_table), partitionBy=("pday", "window_size"), mode="append")
+    else:
+        newDF.write.saveAsTable("%s.%s" % (database, cluster_table), partitionBy=("pday", "window_size"))
+
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        _, loadDate = sys.argv
+        run(loadDate)
+    else:
+        print >> sys.stderr,  """
+        Error! The usage is sp_clustering.py <loadDate>
+        """
