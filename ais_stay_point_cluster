@@ -1,8 +1,6 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
-"""
-@author: yihancai
-"""
+
 import sys
 import pyspark.sql.functions as func
 from pyspark.sql.functions import udf
