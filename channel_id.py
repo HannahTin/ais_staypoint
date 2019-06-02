@@ -45,7 +45,7 @@ def getChannelId(rowsDF):
     spark = startSpark()
     rowsDF = rowsDF.withColumn("pre_timestamp", func.lag("timestamp").over(Window.partitionBy("mmsi").orderBy("timestamp")))
     rowsDF = rowsDF.withColumn("change_channel", func.when((rowsDF.timestamp - rowsDF.pre_timestamp > 86400), 1).otherwise(0))
-    # hash得到航道号
+    # hash to get channel id
     rowsDF = rowsDF.withColumn("channel_num", func.sum("change_channel").over(Window.partitionBy("mmsi").orderBy("timestamp")))
     rowsDF = rowsDF.withColumn("channel_id", func.hash("mmsi", "channel_num"))
     rowsDF = rowsDF.drop("pre_timestamp").drop("change_channel").drop("channel_num")
