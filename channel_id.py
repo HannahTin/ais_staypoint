@@ -41,6 +41,10 @@ def readData(loadDate):
 转换channel_id时，利用前后时间戳表示channel改变的状态(0/1)
 利用状态和与mmsi的哈希值来对channel_id进行命名
 '''
+'''
+Using before and after timestamps denoted the state of channel change (0/1) when converting channel_id
+Name the channel_id using the state and the hash value of mmsi
+'''
 def getChannelId(rowsDF):
     spark = startSpark()
     rowsDF = rowsDF.withColumn("pre_timestamp", func.lag("timestamp").over(Window.partitionBy("mmsi").orderBy("timestamp")))
