@@ -1,6 +1,6 @@
 ### Cai, Y., Tian, M., Yang, W., & Zhang, Y. (2018). Stay point analysis in automatic identification system trajectory data. Proc. 2018 Int. Con. Data Science, 273-278.
 
-**AIS Data Reading & Cleaning, First & Second Staypoint, Staypoint Clustering on 600,000,000 pieces of time series data**
+**AIS Data Reading & Cleaning, First & Second Staypoint, Staypoint Clustering on 600,000,000 pieces of time series data based on pySpark and Hadoop**
 
 This project covers the following steps:
 
